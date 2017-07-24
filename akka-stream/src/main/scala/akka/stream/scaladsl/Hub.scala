@@ -3,6 +3,7 @@
  */
 package akka.stream.scaladsl
 
+import java.util
 import java.util.concurrent.atomic.{ AtomicLong, AtomicReference }
 
 import akka.NotUsed
@@ -17,6 +18,8 @@ import java.util.Arrays
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReferenceArray
+
+import scala.collection.immutable
 import scala.collection.mutable.LongMap
 import scala.collection.immutable.Queue
 import akka.annotation.InternalApi
@@ -741,15 +744,15 @@ object PartitionHub {
    *   identifiers and the second is the stream element. The function should return the selected consumer
    *   identifier for the given element. The function will never be called when there are no active consumers,
    *   i.e. there is always at least one element in the array of identifiers.
-   * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
+   * @param startAfterNrOfConsumers Elements are buffered until this number of consumers have been connected.
    *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
    *   been removed (canceled).
    * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
    *   is backpressured.
    */
-  def statefulSink[T](partitioner: () ⇒ (ConsumerInfo, T) ⇒ Long, startAfterNbrOfConsumers: Int,
+  def statefulSink[T](partitioner: () ⇒ (ConsumerInfo, T) ⇒ Long, startAfterNrOfConsumers: Int,
                       bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
-    Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNbrOfConsumers, bufferSize))
+    Sink.fromGraph(new PartitionHub[T](partitioner, startAfterNrOfConsumers, bufferSize))
 
   /**
    * Creates a [[Sink]] that receives elements from its upstream producer and routes them to a dynamic set
@@ -773,22 +776,28 @@ object PartitionHub {
    *   the first is the number of active consumers and the second is the stream element. The function should
    *   return the index of the selected consumer for the given element, i.e. int greater than or equal to 0
    *   and less than number of consumers. E.g. `(size, elem) => math.abs(elem.hashCode) % size`.
-   * @param startAfterNbrOfConsumers Elements are buffered until this number of consumers have been connected.
+   * @param startAfterNrOfConsumers Elements are buffered until this number of consumers have been connected.
    *   This is only used initially when the stage is starting up, i.e. it is not honored when consumers have
    *   been removed (canceled).
    * @param bufferSize Total number of elements that can be buffered. If this buffer is full, the producer
    *   is backpressured.
    */
-  def sink[T](partitioner: (Int, T) ⇒ Int, startAfterNbrOfConsumers: Int,
+  def sink[T](partitioner: (Int, T) ⇒ Int, startAfterNrOfConsumers: Int,
               bufferSize: Int = defaultBufferSize): Sink[T, Source[T, NotUsed]] =
-    statefulSink(() ⇒ (info, elem) ⇒ info.consumerIds(partitioner(info.size, elem)), startAfterNbrOfConsumers, bufferSize)
+    statefulSink(() ⇒ (info, elem) ⇒ info.consumerIds(partitioner(info.size, elem)), startAfterNrOfConsumers, bufferSize)
 
   @DoNotInherit trait ConsumerInfo extends akka.stream.javadsl.PartitionHub.ConsumerInfo {
 
     /**
-     * Identifiers of current consumers
+     * Sequence of all identifiers of current consumers.
+     *
+     * When attempting to get consumerId by index use the dedicated [[consumerIdByIdx]] method instead,
+     * since it is able to avoid some allocations.
      */
-    def consumerIds: Array[Long]
+    def consumerIds: immutable.IndexedSeq[Long]
+
+    /** Obtain consumer identifier by index */
+    def consumerIdByIdx(idx: Int): Long
 
     /**
      * Approximate number of buffered elements for a consumer.
@@ -959,8 +968,8 @@ object PartitionHub {
  * INTERNAL API
  */
 private[akka] class PartitionHub[T](
-  partitioner:              () ⇒ (PartitionHub.ConsumerInfo, T) ⇒ Long,
-  startAfterNbrOfConsumers: Int, bufferSize: Int)
+  partitioner:             () ⇒ (PartitionHub.ConsumerInfo, T) ⇒ Long,
+  startAfterNrOfConsumers: Int, bufferSize: Int)
   extends GraphStageWithMaterializedValue[SinkShape[T], Source[T, NotUsed]] {
   import PartitionHub.Internal._
   import PartitionHub.ConsumerInfo
@@ -987,24 +996,36 @@ private[akka] class PartitionHub[T](
 
     private val queue = createQueue()
     private var pending = Vector.empty[T]
-    private var consumerInfo: ConsumerInfoImpl = new ConsumerInfoImpl(Array.emptyLongArray, Vector.empty)
+    private var consumerInfo: ConsumerInfoImpl = new ConsumerInfoImpl(Vector.empty)
     private val needWakeup: LongMap[Consumer] = LongMap.empty
 
     private var callbackCount = 0L
 
-    private class ConsumerInfoImpl(override val consumerIds: Array[Long], val consumers: Vector[Consumer])
+    private class ConsumerInfoImpl(val consumers: Vector[Consumer])
       extends ConsumerInfo {
 
       override def queueSize(consumerId: Long): Int =
         queue.size(consumerId)
 
-      override def size: Int = consumerIds.length
+      override def size: Int = consumers.length
+
+      override def consumerIds: immutable.IndexedSeq[Long] =
+        consumers.map(_.id)
+
+      override def consumerIdByIdx(idx: Int): Long =
+        getConsumerIds.get(idx)
+
+      override def getConsumerIds: java.util.List[Long] =
+        new util.AbstractList[Long] {
+          override def get(idx: Int): Long = consumers(idx).id
+          override def size(): Int = consumers.size
+        }
     }
 
     override def preStart(): Unit = {
       setKeepGoing(true)
       callbackPromise.success(getAsyncCallback[HubEvent](onEvent))
-      if (startAfterNbrOfConsumers == 0)
+      if (startAfterNrOfConsumers == 0)
         pull(in)
     }
 
@@ -1030,7 +1051,7 @@ private[akka] class PartitionHub[T](
 
     private def wakeup(id: Long): Unit = {
       needWakeup.get(id) match {
-        case None ⇒
+        case None ⇒ // ignore
         case Some(consumer) ⇒
           needWakeup -= id
           consumer.callback.invoke(Wakeup)
@@ -1073,11 +1094,9 @@ private[akka] class PartitionHub[T](
         case RegistrationPending ⇒
           state.getAndSet(noRegistrationsState).asInstanceOf[Open].registrations foreach { consumer ⇒
             val newConsumers = (consumerInfo.consumers :+ consumer).sortBy(_.id)
-            val newConsumerIds = consumerInfo.consumerIds :+ consumer.id
-            Arrays.sort(newConsumerIds)
-            consumerInfo = new ConsumerInfoImpl(newConsumerIds, newConsumers)
+            consumerInfo = new ConsumerInfoImpl(newConsumers)
             queue.init(consumer.id)
-            if (newConsumers.size >= startAfterNbrOfConsumers) {
+            if (newConsumers.size >= startAfterNrOfConsumers) {
               initialized = true
             }
 
@@ -1093,8 +1112,7 @@ private[akka] class PartitionHub[T](
 
         case UnRegister(id) ⇒
           val newConsumers = consumerInfo.consumers.filterNot(_.id == id)
-          val newConsumerIds = consumerInfo.consumerIds.filterNot(_ == id)
-          consumerInfo = new ConsumerInfoImpl(newConsumerIds, newConsumers)
+          consumerInfo = new ConsumerInfoImpl(newConsumers)
           queue.remove(id)
           if (newConsumers.isEmpty) {
             if (isClosed(in)) completeStage()

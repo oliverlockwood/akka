@@ -28,6 +28,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Supplier;
+import java.util.function.ToLongBiFunction;
 
 public class HubDocTest extends AbstractJavaTest {
 
@@ -183,12 +184,12 @@ public class HubDocTest extends AbstractJavaTest {
   //#partition-hub-stateful-function
   // Using a class since variable must otherwise be final.
   // New instance is created for each materialization of the PartitionHub.
-  static class RoundRobin<T> implements BiFunction<PartitionHub.ConsumerInfo, T, Long> {
+  static class RoundRobin<T> implements ToLongBiFunction<ConsumerInfo, T> {
 
     private long i = -1;
     
     @Override
-    public Long apply(ConsumerInfo info, T elem) {
+    public long applyAsLong(ConsumerInfo info, T elem) {
       i++;
       return info.consumerIds()[(int) (i % info.size())];
     }
